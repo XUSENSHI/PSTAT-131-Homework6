@@ -1,0 +1,257 @@
+---
+title: "Homework6"
+author: "Thomas Shi"
+date: "2022/5/24"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+library(janitor)
+library(ggplot2)
+library(corrplot)
+library(tidyverse)
+library(tidymodels)
+library(rpart.plot)
+library(ranger)
+library(vip)
+library(xgboost)
+set.seed(3435)
+```
+
+1
+```{r, echo = T, fig.width = 8}
+pokemon <- read.csv('Pokemon.csv')
+pokemon <- clean_names(pokemon)
+ggplot( data = pokemon, aes(x = type_1)) + geom_bar()
+pokemon <- pokemon %>% filter(type_1 == 'Bug' | type_1 == 'Fire' | type_1 == 'Grass' | type_1 == 'Normal' 
+                | type_1 == 'Water' | type_1 == 'Psychic')
+#The number of these types of pokemon are greater than 45
+
+pokemon <- pokemon %>%
+  mutate(type_1= factor(type_1),
+         legendary = factor(legendary))
+
+set.seed(3435)
+pokemon_split <- pokemon %>% 
+  initial_split(strata = type_1, prop = 0.7)
+pokemon_train <- training(pokemon_split)
+pokemon_test <- testing(pokemon_split)
+dim(pokemon_train)
+dim(pokemon_test)
+#There are 318 individuals in testing set and 140 individuals in training set
+#The sample sizes will be enough for both sets
+
+set.seed(13)
+pokemon_folds <- vfold_cv(pokemon_train, v = 5, strata = type_1)
+pokemon_folds
+
+
+pokemon_recipe <- recipe(type_1 ~ legendary + generation + sp_atk + attack + speed + defense + hp + sp_def , 
+                         data = pokemon_train)
+
+pokemon_recipe <- pokemon_recipe %>% step_dummy(legendary, generation)
+pokemon_recipe <- pokemon_recipe %>% step_center(all_predictors())
+pokemon_recipe <- pokemon_recipe %>% step_scale(all_predictors())
+
+pokemon_recipe
+```
+
+
+
+2
+```{r, ehco = T}
+pokemon_train %>% 
+  select(where(is.numeric), -generation, -x) %>% 
+  cor(use = "complete.obs") %>% 
+  corrplot(type = "lower", diag = FALSE)
+
+'Total is highly correlated to all other variables which makes sense. The correlation is positive'
+'Defense and attack have a positive correlation which make sense'
+'Defense and sp_def have a strong positive correlation which make sense to me'
+'Attack and sp_attack have a positive correltaion which make sense to me'
+'However, all the correlation is positive which does not make sense to me because I suppose pokemon with high defense will have slow speed'
+```
+
+
+3
+```{r, echo = T}
+tree_spec <- decision_tree() %>%
+  set_engine("rpart")
+class_tree_spec <- tree_spec %>%
+  set_mode("classification")
+
+class_tree_wf <- workflow() %>%
+  add_recipe(pokemon_recipe) %>%
+  add_model(class_tree_spec %>% set_args(cost_complexity = tune()))
+
+param_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+
+tune_res_tree <- tune_grid(
+  class_tree_wf, 
+  resamples = pokemon_folds, 
+  grid = param_grid, 
+  metrics = metric_set(roc_auc)
+)
+
+autoplot(tune_res_tree)
+
+'As complexity increase ROC AUC first increases and then decreases. The maximum ROC AUC occurs when the complexity penalty is around 0.02'
+
+```
+
+
+4
+```{r, echo = T}
+collect_metrics(tune_res_tree) %>% arrange(desc(mean))
+#The ROC_AUC of the best performing tree is 0.642
+
+
+```
+
+
+5
+```{r, echo = T}
+best_tree <- select_best(tune_res_tree)
+best_tree
+class_tree_final <- finalize_workflow(class_tree_wf, best_tree)
+
+class_tree_final_fit <- fit(class_tree_final, data = pokemon_train)
+
+class_tree_final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot(roundint = FALSE)
+```
+
+
+5.1
+```{r, echo = T}
+random_model <-  rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = 'impurity') %>%
+  set_mode("classification")
+
+random_wf <- workflow() %>% 
+  add_recipe(pokemon_recipe) %>%
+  add_model(random_model)
+
+random_grid <- grid_regular(mtry(range = c(1, 8)), 
+                           trees(range = c(100, 2000)), 
+                           min_n(range = c(2, 20)),
+                           levels = 8)
+
+'mtry indicates number of predictors we use when spliting trees. Usually, we do not want all the variables because we want each tree to be independent.'
+
+'trees indicates number of trees we want to fit. The number should be large enough'
+
+'min_n is the stopping condition of each tree. If the node of this tree is smaller than this number, we do not split anymore'
+
+'mtry cannot be smaller than 1 because we need to include at least one predictor. mtry cannot be larger than 8 because we only have 8 predictors. when mtry is equal to 8, it will be a bagging model'
+
+```
+
+
+6
+```{r, echo = T}
+tune_res_random <- tune_grid(
+  random_wf, 
+  resamples = pokemon_folds, 
+  grid = random_grid, 
+  metrics = metric_set(roc_auc)
+)
+
+autoplot(tune_res_random)
+
+'First, when the minimal node size is smaller than 9, we will have our possible maximum roc auc. Also, when the tree size is between 371 and 642 we will have our possible maximum roc auc. Moreover, when the number of randomly selected predictors between 3 to 5 we will have our maximum roc auc.'
+```
+
+
+7
+```{r, echo = T}
+collect_metrics(tune_res_random) %>% arrange(desc(mean))
+'The highest roc_auc is 0.726'
+```
+
+
+8
+```{r, echo = T}
+best_random <- select_best(tune_res_random)
+class_random_final <- finalize_workflow(random_wf, best_random)
+
+class_random_final_fit <- fit(class_random_final, data = pokemon_train)
+
+
+class_random_final_fit %>% extract_fit_engine() %>% vip()
+
+'The most useful variable is sp_atk and the less useful varibale is the legendary. It matches my expectation because special attack is related to the type of pokemon, and legendary pokemon has very small number. There should be no pattern of the type of legendary pokemon'
+```
+
+
+
+9
+```{r, echo = T}
+boost_model <- boost_tree(trees = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+boost_wf <- workflow() %>%
+  add_recipe(pokemon_recipe) %>%
+  add_model(boost_model)
+
+boost_grid <- grid_regular(trees(range = c(10, 2000)), levels = 10)
+
+tune_res_boost <- tune_grid(
+  boost_wf, 
+  resamples = pokemon_folds, 
+  grid = boost_grid, 
+  metrics = metric_set(roc_auc)
+)
+
+autoplot(tune_res_boost)
+
+'As number of trees increase, first the roc_auc increases rapidly, and then starts to decrease. The highest roc_auc occurse when trees are around 1000'
+
+collect_metrics(tune_res_boost) %>% arrange(desc(mean))
+
+'The highest roc_auc is 0.702'
+
+best_boost <- select_best(tune_res_boost)
+class_boost_final <- finalize_workflow(boost_wf, best_boost)
+
+class_boost_final_fit <- fit(class_boost_final, data = pokemon_train)
+
+```
+
+
+10
+```{r, echo = T}
+boost_matrix <- collect_metrics(tune_res_boost) %>% arrange(desc(mean))
+random_matrix <- collect_metrics(tune_res_random) %>% arrange(desc(mean))
+tree_matrix <- collect_metrics(tune_res_tree) %>% arrange(desc(mean))
+
+best_matrix <- bind_rows(boost_matrix[1,], random_matrix[1,], tree_matrix[1,])
+best_matrix
+
+'The best model on the fold is the random forest model'
+
+best_random <- select_best(tune_res_random)
+class_random_final <- finalize_workflow(random_wf, best_random)
+
+class_random_final_fit <- fit(class_random_final, data = pokemon_train)
+
+augment(class_random_final_fit, new_data = pokemon_test) %>%
+  roc_auc(truth = type_1, .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water, .pred_Psychic)
+
+pred_result <- augment(class_random_final_fit, new_data=pokemon_test) %>% select(type_1, .pred_class, .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water, .pred_Psychic)
+
+pred_result %>% roc_curve(type_1, .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water, .pred_Psychic) %>% 
+  autoplot()
+
+
+
+augment(class_random_final_fit, new_data = pokemon_test) %>%
+  conf_mat(truth = type_1, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+'Normal pokemon predict the best. Psychin and water pokemon were predicted poorly'
+```
